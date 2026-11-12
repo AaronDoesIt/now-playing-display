@@ -1,0 +1,201 @@
+# Now Playing: configuration. Copy to config.toml and edit.
+# Every option is shown with its default; delete what you do not change.
+# Unknown options are reported as errors, so typos do not go unnoticed.
+
+[general]
+name = "Now Playing"        # device name in Home Assistant
+instance = "now_playing"    # a-z 0-9 _ ; used in MQTT topics and entity ids
+log_level = "INFO"          # DEBUG, INFO, WARNING, ERROR
+data_dir = "data"           # cover cache + saved switch state; relative to this file
+                            # (on the Pi: "/var/lib/now-playing")
+
+# ------------------------------------------------------------------ audio input
+# ffmpeg does the capturing, so anything ffmpeg can read works.
+#
+#   USB microphone / sound card (ALSA).  List devices with:  arecord -L
+#       format = "alsa"
+#       input  = "plughw:CARD=Device,DEV=0"
+#   PulseAudio / PipeWire:
+#       format = "pulse"
+#       input  = "default"
+#   A camera's microphone over RTSP (ffmpeg picks the format itself):
+#       format = ""
+#       input  = "rtsp://user:password@10.0.0.50:554/cam/realmonitor?channel=1&subtype=1"
+#       input_args = ["-rtsp_transport", "tcp"]
+#   A microphone on the display panel itself, sent over UDP (the firmware for it is
+#   display/esphome/microphone.yaml; an I2S microphone delivers 32-bit samples):
+#       format = "s32le"
+#       input  = "udp://0.0.0.0:5004?overrun_nonfatal=1"
+#       input_args = ["-ar", "16000", "-ac", "1"]
+#       stall_seconds = 0
+#   Any other sender of raw 16-bit PCM over UDP: the same with format = "s16le".
+#   An internet radio stream (handy for testing without a microphone):
+#       format = ""
+#       input  = "https://ice1.somafm.com/seventies-128-mp3"
+[capture]
+input = "default"
+format = "alsa"
+input_args = []             # extra ffmpeg options placed before -i
+sample_rate = 16000         # enough for every recognizer; keeps the buffer small
+buffer_seconds = 30         # how much audio is kept in memory
+ffmpeg_path = "ffmpeg"
+stall_seconds = 15.0        # restart ffmpeg if no audio arrives for this long. Set 0 for a
+                            # UDP input: no packets only means the sender is switched off
+
+# --------------------------------------------------------------- music detector
+# The daemon listens all the time, but only asks a recognition service when it
+# hears music. That decision is made here, on this machine, with no network
+# call: once a second a small neural network (YAMNet, 4 MB, bundled in
+# server/models) scores the latest second of audio for "Music" and "Speech".
+# Dialog, news, phone calls and kitchen noise therefore cost no lookups.
+#
+# Measured on 13 live stations (10 music genres, 3 talk), 90 s each: every
+# second judged correctly on the clean streams and with simulated room reverb
+# and noise down to a 20 dB signal-to-noise ratio; 96 % of music seconds at
+# 10 dB. Talk never opened the gate in any condition.
+# Watch it live with:  audio_recognition_daemon.py levels
+[music_detector]
+enabled = true              # false = look up every sound that is not silence
+model_path = ""             # empty = the bundled server/models/yamnet.tflite
+threshold = 0.35            # smoothed Music score that opens the gate...
+release = 0.15              # ...and the lower score that closes it again
+smooth_seconds = 5.0        # the score is averaged over this long
+hop_seconds = 1.0           # how often the model runs (a few ms each time)
+threads = 1
+
+# -------------------------------------------------------------------- detection
+[detection]
+window_seconds = 8.0        # audio sent per lookup...
+max_window_seconds = 12.0   # ...growing to this after misses (Shazam rejects 15 s or more)
+min_window_seconds = 6.0    # shortest clip worth sending: the first lookup comes this long
+                            # after a song starts. 4 s clips are recognised too, but their
+                            # alignment reading is noisier and more often needs confirming
+search_interval = 15.0      # seconds between lookups while music plays unidentified
+search_max_interval = 120.0 # back-off ceiling for music nobody can name
+locked_interval = 30.0      # seconds between re-checks while a track is showing
+silence_dbfs = -50.0        # quieter than this is silence. Calibrate with
+                            #   audio_recognition_daemon.py levels
+gap_seconds = 1.0           # a pause this long, then sound, is treated as a new track
+idle_after = 20.0           # this long without music clears the display. Silence counts as it is;
+                            # talk counts only after one lookup of it fails to find the track
+hold_seconds = 60.0         # keep showing a track this long without a fresh match
+confirmations = 1           # identical answers needed before a new track is shown
+
+# Optional: fewer lookups for music that plays whole songs (a record player, a
+# radio). OFF by default, because music from a TV is mostly snippets: a song that
+# stops after twenty seconds must not leave its cover up for four minutes.
+# With use_track_length on, the daemon goes quiet once a track is showing:
+# Shazam's answer says how far into the song the clip was, the song's length is
+# looked up once in Apple's catalogue, and the next lookup is timed for just
+# after the song should end (about one lookup per song instead of seven).
+# freeze_seconds is the simpler version, used alone or when the length is not
+# found: wait that long after a new track appears, then re-check as usual.
+# A pause in the sound, a tap on the panel or the Identify button still trigger
+# a lookup at once, and music stopping still clears the display.
+use_track_length = false    # true = time the next lookup for the song's expected end
+freeze_seconds = 0.0        # seconds without lookups after a new track appears; 0 = none
+max_freeze_seconds = 600.0  # never stay quiet longer than this, however long the track is
+
+# ------------------------------------------------------------------ recognizers
+# Tried in this order; the next one is used when one has no match, fails or is
+# rate limited.
+#
+#   shazam    works on a few seconds of room audio. Free, but it is Shazam's app
+#             endpoint via the shazamio library, not a published API.
+#   audd      a documented paid API (300 free requests, then about $5 per 1,000).
+#   acoustid  whole files only. It CANNOT match a mic clip or a mid-song clip
+#             (see README), so listing it here only costs a request per lookup.
+[recognizers]
+order = ["shazam"]
+
+[recognizers.shazam]
+min_interval = 10.0         # seconds between requests
+max_per_minute = 3          # requests in any minute. Measured 2026-11-10: one every 20 s
+                            # was answered every time (9 of 9); one every 15 s was refused
+                            # (HTTP 429) at the sixth. Do not raise this.
+daily_limit = 0             # requests per day, 0 = unlimited
+timeout = 20.0
+language = "en-US"
+endpoint_country = "US"
+confirm_skew = 0.001        # an answer that lines up with the reference recording less
+                            # exactly than this (time or pitch) is shown only after a
+                            # second lookup agrees. Measured: right answers mostly read
+                            # 0.0004 or lower, a wrong one read 0.0100. A copy playing off
+                            # speed (a turntable, some radio) reads high too and simply
+                            # takes one lookup longer. 0 = show every answer at once.
+                            # (see "Results" in the README for the readings)
+
+[recognizers.audd]
+api_token = ""              # or the NOWPLAYING_AUDD_API_TOKEN environment variable
+min_interval = 5.0
+daily_limit = 300           # protects the bill
+timeout = 20.0
+
+[recognizers.acoustid]
+api_key = ""                # or NOWPLAYING_ACOUSTID_API_KEY. Register an application
+                            # at https://acoustid.org/new-application
+min_score = 0.6
+fpcalc_path = "fpcalc"      # Debian: sudo apt install libchromaprint-tools
+min_interval = 1.0          # AcoustID allows 3 requests a second
+daily_limit = 0
+timeout = 10.0
+
+# --------------------------------------------------------------------- metadata
+[metadata]
+contact = ""                # MusicBrainz asks every client to identify itself: put a URL
+                            # or e-mail address here. It is sent in the User-Agent header.
+musicbrainz = true          # look up albums on MusicBrainz (needed for Cover Art Archive
+                            # art when the recognizer gave no MusicBrainz ids)
+
+# -------------------------------------------------------------------- cover art
+# Whatever the source serves is converted to one square baseline JPEG, so the
+# display only ever loads a small file from this machine over plain HTTP.
+[artwork]
+size = 480                  # the panel is 480 x 480
+fit = "cover"               # "cover" crops to fill, "contain" letterboxes
+quality = 85
+sources = ["recognizer", "coverartarchive", "itunes"]   # tried in this order
+wait_seconds = 2.0          # publish with a generated cover if the real one takes longer,
+                            # then publish again when it arrives
+cache_max_files = 500
+font_path = ""              # TrueType font for generated covers, e.g. a Noto font for
+                            # non-Latin titles
+
+[http]
+host = "0.0.0.0"
+port = 8777
+public_base_url = ""        # how the display reaches this server, e.g.
+                            # "http://10.0.0.151:8777". Empty = detect the LAN address.
+
+# ------------------------------------------------------------------------- MQTT
+[mqtt]
+enabled = true
+host = "127.0.0.1"
+port = 1883
+username = ""               # or NOWPLAYING_MQTT_USERNAME
+password = ""               # or NOWPLAYING_MQTT_PASSWORD (keep it out of this file)
+tls = false
+client_id = ""              # default: nowplaying-<instance>
+base_topic = "nowplaying"   # topics are <base_topic>/<instance>/...
+discovery = true            # create the Home Assistant entities automatically
+discovery_prefix = "homeassistant"
+level_interval = 15.0       # seconds between input-level reports, 0 = off
+
+# ---------------------------------------------------------- tracks pushed from HA
+# Home Assistant can publish a track to <base_topic>/<instance>/external/set
+# (JSON: state, title, artist, album, art_url, source). While one is playing it
+# is shown instead of the acoustic result and no lookups are made.
+[external]
+enabled = true
+ha_base_url = ""            # e.g. "http://10.0.0.151:8123"; needed when art_url is a
+                            # relative entity_picture such as /api/media_player_proxy/...
+
+# ---------------------------------------------------------- pictures while idle
+# While no music is detected the panel can show your own pictures in turn instead
+# of the plain tile. Put JPEG or PNG files in a folder; they are shown in name
+# order, cropped to a square and converted like covers. New files are picked up
+# within a minute, without a restart.
+[idle]
+images_dir = ""             # e.g. "/var/lib/now-playing/slides"; empty = the plain tile.
+                            # A relative path is taken from this file's folder
+slide_seconds = 10.0        # how long each picture stays (3 or more)

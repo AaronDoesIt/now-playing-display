@@ -1,0 +1,72 @@
+# Now Playing on the Pi Zero 2 W inside the retro TV (hostname PiDisplay, 10.0.0.61).
+# Installed as /etc/now-playing/config.toml by deploy/setup-pi-zero.sh.
+# Only the options that differ from the defaults; server/config.example.toml lists them all.
+
+[general]
+name = "Now Playing"
+instance = "now_playing"
+data_dir = "/var/lib/now-playing"
+
+# Until a microphone is wired to this Pi, it takes its sound from the network: raw
+# 16-bit, 16 kHz, mono audio sent to UDP port 5004. Whatever sends there is "the
+# microphone", and switching needs no sudo and no restart:
+#   - the laptop's own microphone: tools\laptop_mic_to_pi.ps1, run on the laptop
+#   - an internet radio station, relayed by the Pi itself:
+#       ffmpeg -loglevel error -i http://ice1.somafm.com/seventies-128-mp3 \
+#              -ac 1 -ar 16000 -f s16le "udp://127.0.0.1:5004?pkt_size=1024"
+# With nothing sending, the daemon hears nothing and shows the idle pictures.
+# With an I2S microphone on the 40-pin header this becomes (check the name with
+# arecord -L, and drop input_args and stall_seconds):
+#   format = "alsa"
+#   input  = "plughw:CARD=sndrpigooglevoi,DEV=0"
+[capture]
+format = "s16le"
+input = "udp://0.0.0.0:5004?overrun_nonfatal=1"
+input_args = ["-ar", "16000", "-ac", "1"]
+stall_seconds = 0
+
+[http]
+host = "0.0.0.0"
+port = 8777
+public_base_url = "http://10.0.0.61:8777"
+
+# This display is for catching songs heard on the TV, which are mostly snippets.
+# So while a track is showing it is re-checked every 30 seconds, and the two
+# "quiet period" options (wait for the song's listed end, or freeze for a while)
+# stay off. They are described in server/config.example.toml.
+[detection]
+locked_interval = 30.0
+use_track_length = false
+freeze_seconds = 0.0
+
+# Shazam's answer comes with a figure for how well the clip lines up with its
+# reference recording; an answer above confirm_skew is "doubtful" and is shown
+# only if the next lookup agrees. Through a microphone in a room that figure is
+# noisier than on a clean stream. Measured 2026-11-11 through the laptop's
+# microphone, 40 answers over 20 minutes of songs played in the room: right
+# answers ran from 0.0001 to 0.0024, with a few between 0.003 and 0.006 on quiet
+# or very first clips. The one wrong answer seen in the stream tests read 0.0100.
+# The default of 0.001 held back a third of the right answers, which for short
+# snippets from a TV can mean no cover at all; 0.003 holds back about one in
+# eight and still stops the 0.01 kind.
+[recognizers.shazam]
+confirm_skew = 0.003
+
+# Covers and idle pictures are made at 450 px, the size the panel draws them
+# (resize: in the firmware YAML), so the panel does not scale anything. The mask
+# of the retro TV case shows a 420 px square in full; 450 is Aaron's choice,
+# halfway to the full 480, with the four corners rounded off by the mask.
+[artwork]
+size = 450
+
+# Your own pictures, shown in turn while no music is detected. The folder belongs
+# to the admin user: copy files in or delete them, no sudo and no restart needed.
+[idle]
+images_dir = "/srv/now-playing/slides"
+slide_seconds = 10.0
+
+# The broker is Mosquitto on this same Pi. The login is in /etc/now-playing/secrets.env.
+[mqtt]
+enabled = true
+host = "127.0.0.1"
+port = 1883

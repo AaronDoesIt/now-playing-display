@@ -1,0 +1,492 @@
+# Now Playing display: Guition ESP32-S3-4848S040 (4.0" 480x480 "86 box" panel)
+#
+# A thin client. It subscribes to one retained MQTT topic for the track text and
+# fetches one square baseline JPEG per track from the recognition server over
+# plain HTTP. No TLS, no scaling, no audio processing on the panel.
+#
+# STATUS: running on the real panel since 2026-11-11 (ESPHome 2026.10.2; flashed
+# over USB once, over Wi-Fi since; the Windows build recipe is in the README).
+# What is still to be looked at on the hardware is marked CHECK ON HARDWARE.
+#
+# Two warnings from `esphome config` are expected on this board: GPIO19 and
+# GPIO20 "are used by USB-Serial-JTAG" (the board wires them to the touch
+# controller and a green data line instead), and the OTA password note.
+#
+# Build with the ESPHome add-on (or `esphome run now-playing-display.yaml`).
+# Copy secrets.example.yaml to secrets.yaml first.
+
+substitutions:
+  name: now-playing-display
+  friendly_name: Now Playing Display
+  # where the recognition daemon's HTTP server is (http.public_base_url):
+  # the Pi Zero 2 W in the TV (PiDisplay). Only used for the very first picture;
+  # after that every track message carries its own full cover address.
+  server: "http://10.0.0.61:8777"
+  # <mqtt.base_topic>/<general.instance> from the daemon's config.toml
+  topic_root: nowplaying/now_playing
+  brightness_playing: "100%"
+  brightness_idle: "30%"
+
+esphome:
+  name: ${name}
+  friendly_name: ${friendly_name}
+  on_boot:
+    priority: -100            # after Wi-Fi and LVGL are up
+    then:
+      - light.turn_on:
+          id: backlight
+          brightness: ${brightness_idle}
+
+esp32:
+  variant: esp32s3
+  flash_size: 16MB
+  framework:
+    type: esp-idf
+    advanced:
+      # Keep code running from PSRAM so the RGB panel is not starved (and does not
+      # flicker or drift) while flash is written during OTA or Wi-Fi activity.
+      execute_from_psram: true
+
+psram:
+  mode: octal                 # ESP32-S3-N16R8: 8 MB octal PSRAM (uses GPIO 35-37)
+  speed: 80MHz
+
+logger:
+  hardware_uart: UART0        # the USB-C port is a CH340 on UART0, not native USB
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  ap:
+    ssid: "${name} setup"
+
+captive_portal:
+
+# Home Assistant sees the device (backlight, restart, diagnostics) through the
+# native API; the track data itself comes straight from MQTT so the display
+# keeps working when Home Assistant is restarting.
+api:
+  encryption:
+    key: !secret api_encryption_key
+  reboot_timeout: 0s          # do not reboot just because HA is away
+
+ota:
+  - platform: esphome
+    password: !secret ota_password
+    on_begin:                 # avoid a flickering panel while flash is rewritten
+      - light.turn_off:
+          id: backlight
+          transition_length: 0s
+
+mqtt:
+  broker: !secret mqtt_broker
+  username: !secret mqtt_username
+  password: !secret mqtt_password
+  discovery: false            # entities reach HA through the API, not twice
+  reboot_timeout: 0s
+  on_json_message:
+    - topic: ${topic_root}/state
+      then:
+        # `x` is only valid inside this lambda, so copy what we need first.
+        - lambda: |-
+            id(track_state) = x["state"] | "idle";
+            id(track_title) = x["title"] | "";
+            id(track_artist) = x["artist"] | "";
+            id(track_album) = x["album"] | "";
+            id(art_source) = x["art_source"] | "";
+            std::string url = x["art_url"] | "";
+            if (!url.empty()) id(art_url) = url;    // the picture that belongs on screen now
+            id(art_tries) = 0;                      // the server is talking: (re)try its picture
+        - script.execute: load_art
+        - if:
+            condition:
+              lambda: 'return id(art_url) == id(art_loaded);'
+            then:
+              - script.execute: show_track          # the right picture is already up
+            else:
+              # The text waits for its picture, so the two always change together
+              # (show_track runs when the picture lands). show_late is the safety
+              # net: if the picture does not come, the text goes up without it.
+              - if:
+                  condition:
+                    not:
+                      script.is_running: show_late
+                  then:
+                    - script.execute: show_late
+  on_message:
+    - topic: ${topic_root}/availability
+      then:
+        - lambda: 'id(server_online) = (x == "online");'
+        - script.execute: show_track
+
+http_request:
+  timeout: 8s
+
+globals:
+  - id: track_state
+    type: std::string
+    initial_value: '"idle"'
+  - id: track_title
+    type: std::string
+    initial_value: '""'
+  - id: track_artist
+    type: std::string
+    initial_value: '""'
+  - id: track_album
+    type: std::string
+    initial_value: '""'
+  - id: art_url
+    type: std::string
+    initial_value: '""'
+  - id: art_source
+    type: std::string
+    initial_value: '""'
+  # Pictures. art_url (above) is the one that belongs on screen, from the last
+  # message; art_loaded is the one that is on screen; art_loading is the one being
+  # fetched right now, if any; art_tries counts attempts since the last message.
+  - id: art_loaded
+    type: std::string
+    initial_value: '""'
+  - id: art_loading
+    type: std::string
+    initial_value: '""'
+  - id: art_tries
+    type: int
+    initial_value: "0"
+  - id: server_online
+    type: bool
+    initial_value: "false"
+
+script:
+  # Fetch the picture that belongs on screen, unless it is there already.
+  #
+  # The image component loads ONE picture at a time, and a request made while
+  # another picture is still coming in is thrown away ("Image already being
+  # updated" in the log). A picture takes about a second, and the idle pictures
+  # change every ten, so a song recognised at the wrong moment lost its cover: the
+  # idle picture stayed up under the song's text until the next change
+  # (2026-11-11, reproduced with tools/picture_race_test.py).
+  # So nothing is asked for while a picture is loading. The wanted address is only
+  # remembered (art_url), and this script runs again when the load ends, and on a
+  # timer, which also retries a failed download (3 tries per message).
+  - id: load_art
+    mode: single
+    then:
+      - lambda: |-
+          if (id(art_url).empty() || id(art_url) == id(art_loaded)) return;
+          if (!id(art_loading).empty()) {
+            if (id(cover_art).is_decoding()) return;    // one at a time
+            id(art_loading) = "";                       // nothing is coming in after all
+          }
+          if (id(art_tries) >= 3) return;
+          id(art_tries) += 1;
+          id(art_loading) = id(art_url);
+          id(cover_art).set_url(id(art_url));
+          id(cover_art).update();
+
+  # The text of a message goes up when its picture does. If the picture has not
+  # arrived after this long (server trouble), the text goes up anyway.
+  - id: show_late
+    mode: single
+    then:
+      - delay: 4s
+      - script.execute: show_track
+
+  - id: show_track
+    mode: restart
+    then:
+      - lambda: |-
+          ESP_LOGD("screen", "showing %s: %s", id(track_state).c_str(), id(track_title).c_str());
+      - lvgl.label.update:
+          id: lbl_title
+          text: !lambda 'return id(track_title).c_str();'
+      - lvgl.label.update:
+          id: lbl_artist
+          text: !lambda 'return id(track_artist).c_str();'
+      - lvgl.label.update:
+          id: lbl_album
+          text: !lambda 'return id(track_album).c_str();'
+      - if:
+          condition:
+            lambda: 'return id(server_online) && id(track_state) == "playing";'
+          then:
+            - lvgl.widget.show: box_text
+            - lvgl.widget.hide: lbl_status
+            - light.turn_on:
+                id: backlight
+                brightness: ${brightness_playing}
+          else:
+            - lvgl.widget.hide: box_text
+            - lvgl.label.update:
+                id: lbl_status
+                text: !lambda |-
+                  if (!id(server_online)) return "Server offline";
+                  if (id(track_state) == "off") return "Not listening";
+                  return "Listening";
+            - if:
+                condition:
+                  # one of your own pictures is up (the idle slideshow): leave it clean
+                  lambda: >-
+                    return id(server_online) && id(track_state) == "idle"
+                      && id(art_source) == "slide";
+                then:
+                  - lvgl.widget.hide: lbl_status
+                else:
+                  - lvgl.widget.show: lbl_status
+            - light.turn_on:
+                id: backlight
+                brightness: ${brightness_idle}
+
+# A second net under load_art: whatever happens, a picture that belongs on screen
+# and is not there is asked for again.
+interval:
+  - interval: 2s
+    then:
+      - script.execute: load_art
+
+# ------------------------------------------------------------------ the panel
+# Pin map (the same in ESPHome's device database, ESPHome's built-in model,
+# openHASP, Arduino_GFX and the vendor's IO table):
+#
+#   ST7701S init, 3-wire SPI   CS 39   SCK 48   MOSI 47   (bus shared with the SD slot)
+#   RGB565 parallel            DE 18   VSYNC 17   HSYNC 16   PCLK 21 (12 MHz)
+#     red   R0-R4              11 12 13 14 0
+#     green G0-G5              8 20 3 46 9 10
+#     blue  B0-B4              4 5 6 7 15
+#   Backlight (PWM)            38
+#   GT911 touch, I2C           SDA 19   SCL 45   (INT and RST not connected, address 0x5D)
+#   Relays (relay model only)  40, 2, 1   (the same pins are I2S on audio boards)
+#   SD card                    CS 42   MOSI 47   SCK 48   MISO 41
+#   UART0 to the CH340         TX 43   RX 44
+#   Not available              35 36 37 (octal PSRAM)
+#
+# The built-in model below carries all of the display pins and timings.
+spi:
+  - id: lcd_spi
+    clk_pin: GPIO48
+    mosi_pin: GPIO47
+
+i2c:
+  - id: touch_bus
+    sda: GPIO19
+    scl:
+      number: GPIO45
+      ignore_strapping_warning: true
+
+display:
+  - platform: mipi_rgb
+    model: GUITION-4848S040
+    id: panel
+    update_interval: never
+    auto_clear_enabled: false
+    # CHECK ON HARDWARE: a few units show a black or shifted picture with the
+    # built-in model (ESPHome issues 13569 and 17810). If yours does, replace this
+    # block with the st7701s one in display-st7701s-fallback.yaml.
+
+touchscreen:
+  - platform: gt911
+    id: touch
+    display: panel
+    # CHECK ON HARDWARE: if touches land mirrored, add
+    #   transform: {mirror_x: true, mirror_y: true}
+    # Each touch is logged (before LVGL's rotation is applied) so the position
+    # can be checked from the log: with `rotation: 180`, a touch on the top-left
+    # corner of the upright picture should read close to x=479 y=479.
+    on_touch:
+      - logger.log:
+          level: INFO
+          format: "touch x=%d y=%d"
+          args: ["touch.x", "touch.y"]
+
+output:
+  - platform: ledc
+    id: backlight_output
+    pin: GPIO38
+    frequency: 150Hz
+    min_power: 0.01
+    zero_means_zero: true
+
+light:
+  - platform: monochromatic
+    id: backlight
+    name: Backlight
+    output: backlight_output
+    restore_mode: ALWAYS_ON
+    default_transition_length: 300ms
+
+button:
+  - platform: restart
+    name: Restart
+
+sensor:
+  - platform: wifi_signal
+    name: Wi-Fi signal
+    update_interval: 60s
+
+# ------------------------------------------------------------------ cover art
+# The daemon serves every cover as a square baseline JPEG with a Content-Length,
+# which is exactly what this decoder needs (it does not do progressive JPEGs).
+#
+# THE VISIBLE SQUARE. Measured on 2026-11-11 with a stripe pattern on the panel
+# in the printed case: the mask hides about 6 to 10 pixels along each edge, and
+# its rounded corners (about 60 px radius) cut much deeper. The largest square
+# that shows in full is 420 x 420, 30 px in from every side.
+#
+# THE PICTURE IS 450 x 450, 15 px in from every side: Aaron's choice (2026-11-11),
+# halfway between the full 480 and that 420 square, so it fills the screen a bit
+# more. Its edges show in full; the mask rounds off its four corners by about
+# 20 px. The TEXT and the status tag stay inside the 420 square, where nothing is
+# hidden. The server renders covers and idle pictures at 450 px (artwork.size =
+# 450 in its config), so nothing is scaled on the panel.
+# With no case, or a mask with a square window, go back to 480 and 0.
+image:
+  - platform: online_image
+    id: cover_art
+    url: "${server}/art/current.jpg"
+    format: JPEG
+    type: RGB565
+    resize: 450x450
+    update_interval: never
+    on_download_finished:
+      - lambda: |-
+          id(art_loaded) = id(art_loading);
+          id(art_loading) = "";
+          id(art_tries) = 0;
+          ESP_LOGD("screen", "picture on screen: %s", id(art_loaded).c_str());
+      - lvgl.image.update:
+          id: img_cover
+          src: cover_art
+      - if:
+          condition:
+            lambda: 'return id(art_loaded) == id(art_url);'
+          then:
+            # the picture the last message asked for: its text goes up with it
+            - script.stop: show_late
+            - script.execute: show_track
+          else:
+            # A picture that was overtaken while it loaded. The one that belongs
+            # here is fetched next; until then no song text sits on the wrong one.
+            - lvgl.widget.hide: box_text
+      # The next picture cannot be started from inside this callback: the component
+      # is still closing the finished download and would cancel the new one.
+      - delay: 50ms
+      - script.execute: load_art
+    on_error:
+      - lambda: |-
+          ESP_LOGW("screen", "could not load %s", id(art_loading).c_str());
+          id(art_loading) = "";
+          id(art_loaded) = "";        // an interrupted load can leave no picture at all
+
+# ------------------------------------------------------------------------- UI
+font:
+  # Latin text with accents. Titles in other scripts need a font that has them.
+  # bpp 4 = smooth edges. The glyph set lists combining accents that Roboto does
+  # not have as separate glyphs; they are not needed, so the warning is silenced.
+  - file: "gfonts://Roboto@500"
+    id: font_title
+    size: 30
+    bpp: 4
+    glyphsets: [GF_Latin_Core]
+    ignore_missing_glyphs: true
+  - file: "gfonts://Roboto"
+    id: font_artist
+    size: 24
+    bpp: 4
+    glyphsets: [GF_Latin_Core]
+    ignore_missing_glyphs: true
+  - file: "gfonts://Roboto"
+    id: font_small
+    size: 18
+    bpp: 4
+    glyphsets: [GF_Latin_Core]
+    ignore_missing_glyphs: true
+
+lvgl:
+  displays:
+    - panel
+  touchscreens:
+    - touch
+  # Checked on hardware 2026-11-11: without a rotation the picture is upright
+  # when the USB socket is on the LEFT edge. The retro TV case holds the panel
+  # with the socket on the RIGHT, so the picture is turned 180 degrees here.
+  # LVGL turns the touch points with it. (For a socket facing down it would be
+  # 90, facing up 270; rotate in LVGL, not in the display driver.)
+  rotation: 180
+  pages:
+    - id: page_now_playing
+      bg_color: 0x000000
+      pad_all: 0
+      scrollable: false
+      widgets:
+        - image:
+            id: img_cover
+            src: cover_art
+            x: 15
+            y: 15
+            width: 450
+            height: 450
+            clickable: true
+            on_click:
+              # tap the cover to ask for an identification right now
+              - mqtt.publish:
+                  topic: ${topic_root}/identify
+                  payload: PRESS
+        - obj:
+            id: box_text
+            hidden: true
+            # The dark band runs across the bottom of the 450 px picture. The padding
+            # puts the text where it was in the 420 px square (x 42 to 438, starting
+            # at y 338), so the mask's rounded corners do not touch it.
+            x: 15
+            y: 326
+            width: 450
+            height: 139
+            radius: 0
+            border_width: 0
+            bg_color: 0x000000
+            bg_opa: 70%
+            pad_top: 12
+            pad_bottom: 12
+            pad_left: 27
+            pad_right: 27
+            scrollable: false
+            clickable: false
+            widgets:
+              - label:
+                  id: lbl_title
+                  align: TOP_LEFT
+                  width: 396
+                  long_mode: SCROLL_CIRCULAR
+                  text_font: font_title
+                  text_color: 0xFFFFFF
+                  text: ""
+              - label:
+                  id: lbl_artist
+                  align: TOP_LEFT
+                  y: 40
+                  width: 396
+                  long_mode: SCROLL_CIRCULAR
+                  text_font: font_artist
+                  text_color: 0xE3E5EA
+                  text: ""
+              - label:
+                  id: lbl_album
+                  align: TOP_LEFT
+                  y: 74
+                  width: 396
+                  long_mode: DOT
+                  text_font: font_small
+                  text_color: 0xA9ADB6
+                  text: ""
+        - label:
+            id: lbl_status
+            align: TOP_LEFT
+            x: 40
+            y: 40
+            text_font: font_small
+            text_color: 0xA9ADB6
+            bg_color: 0x000000
+            bg_opa: 60%
+            pad_all: 6
+            radius: 8
+            text: "Connecting"

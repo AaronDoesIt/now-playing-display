@@ -1,0 +1,43 @@
+# systemd unit for the Now Playing recognition daemon.
+# Installed by deploy/install.sh as /etc/systemd/system/now-playing.service.
+#
+#   sudo systemctl enable --now now-playing
+#   journalctl -u now-playing -f
+#
+# NOT YET RUN ON THE PI: written for Debian 12, review before enabling.
+
+[Unit]
+Description=Now Playing: music recognition for the album-art display
+After=network-online.target sound.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=nowplaying
+Group=nowplaying
+# access to ALSA capture devices (USB microphones, sound cards)
+SupplementaryGroups=audio
+WorkingDirectory=/opt/now-playing/server
+ExecStart=/opt/now-playing/venv/bin/python /opt/now-playing/server/audio_recognition_daemon.py -c /etc/now-playing/config.toml run
+# NOWPLAYING_MQTT_PASSWORD=... and other secrets, one per line; the leading "-"
+# makes the file optional
+EnvironmentFile=-/etc/now-playing/secrets.env
+Environment=PYTHONUNBUFFERED=1
+Restart=always
+RestartSec=5
+# gives the service /var/lib/now-playing (the cover cache and saved switch state)
+StateDirectory=now-playing
+
+# Keep the service in its box. It needs the network, the audio device and its
+# state directory, nothing else.
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+MemoryMax=700M
+
+[Install]
+WantedBy=multi-user.target

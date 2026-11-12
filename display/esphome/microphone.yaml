@@ -1,0 +1,85 @@
+# Optional package: a microphone on the panel, streamed to the recognition daemon.
+#
+# The Guition ESP32-S3-4848S040 has no microphone of its own. This adds a small
+# I2S MEMS microphone (INMP441 or similar) on the three spare signal pins and
+# sends what it hears to the Pi as raw audio over UDP. The Pi does everything
+# else: it decides whether it is music and asks the recognition service.
+#
+# Enable it by adding these lines to now-playing-display.yaml:
+#
+#     packages:
+#       microphone: !include microphone.yaml
+#
+# and set the daemon's config.toml to listen for it:
+#
+#     [capture]
+#     format = "s32le"          # this microphone delivers 32-bit samples
+#     input = "udp://0.0.0.0:5004?overrun_nonfatal=1"
+#     input_args = ["-ar", "16000", "-ac", "1"]
+#     stall_seconds = 0
+#
+# What goes over the wire: ESPHome reads the microphone 16 ms at a time, so the
+# panel sends about 62 datagrams a second, each 1024 bytes (256 samples, 32-bit
+# little-endian, mono, 16 kHz). That is 64 KB/s on the LAN, nothing more.
+#
+# STATUS: draft. `esphome config` accepts it (2026.10.2) and the packet format
+# above was read from ESPHome's source, but it has never run on hardware. The
+# daemon side is tested with a simulated sender of exactly this format.
+
+substitutions:
+  mic_server: "10.0.0.151"      # the machine running the recognition daemon
+  mic_port: "5004"
+  # The 2x4 socket on the back (H1) carries these three GPIOs. On the mains model
+  # they switch the relays in the base, so this only works with no base attached.
+  # H1 has 5 V (pin 8) and ground (pins 1, 2) but no 3.3 V: power the microphone
+  # from test pad S3 or from a 3.3 V regulator on pin 8. Never from 5 V.
+  mic_bclk_pin: GPIO1           # H1 pin 7 -> microphone SCK
+  mic_ws_pin: GPIO2             # H1 pin 5 -> microphone WS (also called LRCL)
+  mic_data_pin: GPIO40          # H1 pin 3 -> microphone SD (data out of the microphone)
+
+i2s_audio:
+  - id: mic_bus
+    i2s_lrclk_pin: ${mic_ws_pin}
+    i2s_bclk_pin: ${mic_bclk_pin}
+
+udp:
+  - id: mic_udp
+    addresses: ${mic_server}
+    port: ${mic_port}
+
+microphone:
+  - platform: i2s_audio
+    id: room_mic
+    i2s_audio_id: mic_bus
+    i2s_din_pin: ${mic_data_pin}
+    adc_type: external
+    pdm: false
+    channel: left               # INMP441 with its L/R pin tied to ground. If no audio
+                                # arrives, try "right": boards differ on this
+    sample_rate: 16000          # what the daemon and its music detector expect
+    bits_per_sample: 32bit      # the INMP441 sends 24-bit samples in 32-bit frames
+    correct_dc_offset: true     # MEMS microphones sit slightly off zero
+    on_data:
+      - udp.write:
+          id: mic_udp
+          data: !lambda 'return x;'
+
+# Send audio only while Wi-Fi is up and the daemon's Listening switch is on. With
+# the switch off, nothing leaves the panel.
+wifi:
+  on_connect:
+    - microphone.capture: room_mic
+  on_disconnect:
+    - microphone.stop_capture: room_mic
+
+mqtt:
+  on_message:
+    - topic: ${topic_root}/listening
+      then:
+        - if:
+            condition:
+              lambda: 'return x == "OFF";'
+            then:
+              - microphone.stop_capture: room_mic
+            else:
+              - microphone.capture: room_mic

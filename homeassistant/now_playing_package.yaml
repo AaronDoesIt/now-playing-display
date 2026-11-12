@@ -1,0 +1,82 @@
+# Home Assistant package for the Now Playing daemon. Optional.
+#
+# The daemon's sensors, cover image, switch and button appear on their own via
+# MQTT discovery; nothing here is needed for those. This file adds two things
+# discovery cannot do:
+#
+#   1. a real media_player entity (so media cards work), and
+#   2. an automation that shows what a Home Assistant media_player (Spotify,
+#      a TV, an Echo) is playing, with no acoustic lookup at all.
+#
+# To use it: put this file in /config/packages/ and have this in configuration.yaml:
+#
+#     homeassistant:
+#       packages: !include_dir_named packages
+#
+# STATUS: written from the Home Assistant documentation, not yet loaded into a
+# running Home Assistant. Run "Check configuration" before restarting.
+# The topics assume the daemon defaults: base_topic "nowplaying", instance
+# "now_playing". Change every "nowplaying/now_playing" below if yours differ.
+
+# --- 1. A media_player ---------------------------------------------------------
+# Needs Home Assistant 2026.11 or newer: the first release with a template
+# media_player. (Home Assistant has no MQTT media_player, which is why the
+# daemon cannot create this entity itself.)
+template:
+  - triggers:
+      - trigger: mqtt
+        topic: nowplaying/now_playing/state
+    media_player:
+      - name: Now Playing
+        unique_id: now_playing_template_media_player
+        device_class: speaker
+        # the daemon publishes playing / idle / off, which are valid states as they are
+        state: "{{ trigger.payload_json.state }}"
+        media_content_type: music
+        media_title: "{{ trigger.payload_json.title or none }}"
+        media_artist: "{{ trigger.payload_json.artist or none }}"
+        media_album_name: "{{ trigger.payload_json.album or none }}"
+        media_image_url: "{{ trigger.payload_json.art_url }}"
+        # the power button doubles as the daemon's Listening switch
+        turn_on:
+          - action: mqtt.publish
+            data:
+              topic: nowplaying/now_playing/listening/set
+              payload: "ON"
+        turn_off:
+          - action: mqtt.publish
+            data:
+              topic: nowplaying/now_playing/listening/set
+              payload: "OFF"
+
+# --- 2. Show what a known player is playing --------------------------------------
+# While this player is playing, the daemon shows its track and makes no lookups;
+# when it stops, the daemon goes back to listening to the room.
+#
+# Set external.ha_base_url in the daemon's config.toml (for example
+# "http://10.0.0.151:8123"): the artwork address Home Assistant gives for most
+# players, Spotify included, is a relative /api/media_player_proxy/... path.
+#
+# Change the entity to the player you want mirrored. An account-level Spotify
+# entity reports whatever that account plays on any device, so if the display
+# should only follow one room, add a condition on its "source" attribute.
+automation:
+  - id: now_playing_mirror_media_player
+    alias: "Now Playing: show what Spotify is playing"
+    mode: restart
+    triggers:
+      - trigger: state
+        entity_id: media_player.spotify_yourname    # change to your own media_player entity
+    actions:
+      - action: mqtt.publish
+        data:
+          topic: nowplaying/now_playing/external/set
+          payload: >-
+            {{ {
+              "state": trigger.to_state.state if trigger.to_state else "idle",
+              "title": state_attr(trigger.entity_id, "media_title") or "",
+              "artist": state_attr(trigger.entity_id, "media_artist") or "",
+              "album": state_attr(trigger.entity_id, "media_album_name") or "",
+              "art_url": state_attr(trigger.entity_id, "entity_picture") or "",
+              "source": "spotify"
+            } | to_json }}

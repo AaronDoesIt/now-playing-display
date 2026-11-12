@@ -1,0 +1,21 @@
+# Python
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# local configuration and secrets
+server/config.toml
+display/esphome/secrets.yaml
+*.env
+
+# runtime data (cover cache, saved switch state)
+server/data/
+
+# ESPHome build output
+display/esphome/.esphome/
+
+# Personal pictures: the photos shown on the display while idle, their originals
+# and working photos. Not published unless you decide to (idle_images/README.md).
+/*.jpg
+/idle_images/*.jpg

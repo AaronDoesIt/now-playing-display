@@ -1,0 +1,4 @@
+-r requirements.txt
+pytest>=8
+imageio-ffmpeg>=0.5     # ships an ffmpeg binary, so the tests run where ffmpeg is not installed
+amqtt>=0.11             # a small MQTT broker in Python, for tests/live_check.py

@@ -1,0 +1,29 @@
+# Try the daemon on any PC: no microphone, no MQTT broker, no display needed.
+#
+# An internet radio station stands in for the room's microphone, and the result
+# is shown in a browser:
+#
+#     python audio_recognition_daemon.py -c config.preview.toml run
+#     then open http://127.0.0.1:8777
+#
+# The page is a preview of what the 480x480 panel is sent. Everything else is
+# the real thing: the music detector, the Shazam lookups (about two a minute
+# while music plays) and the cover-art conversion.
+
+[general]
+name = "Now Playing (preview)"
+instance = "preview"
+
+[capture]
+format = ""
+input = "http://ice1.somafm.com/seventies-128-mp3"    # SomaFM "Left Coast 70s"
+# For a talk station, to watch the detector keep the gate shut:
+# input = "http://npr-ice.streamguys1.com/live.mp3"
+
+[mqtt]
+enabled = false
+
+[http]
+host = "127.0.0.1"
+port = 8777
+public_base_url = "http://127.0.0.1:8777"

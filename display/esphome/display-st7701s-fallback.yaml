@@ -1,0 +1,44 @@
+# Fallback display block for the Guition ESP32-S3-4848S040.
+#
+# Use this INSTEAD of the `display:` block in now-playing-display.yaml only if
+# the built-in `mipi_rgb` model gives a black or shifted picture on your unit.
+# It is the configuration published in the ESPHome device database for this
+# board, which users with affected units report as working. The `st7701s`
+# platform is marked for removal in a future ESPHome release, so prefer the
+# built-in model if it works.
+#
+# Not a complete configuration: paste the block below over the display block.
+
+display:
+  - platform: st7701s
+    id: panel
+    update_interval: never
+    auto_clear_enabled: false
+    spi_mode: MODE3
+    data_rate: 2MHz
+    color_order: RGB
+    invert_colors: false
+    dimensions:
+      width: 480
+      height: 480
+    cs_pin: 39
+    de_pin: 18
+    hsync_pin: 16
+    vsync_pin: 17
+    pclk_pin: 21
+    pclk_frequency: 12MHz
+    pclk_inverted: false
+    hsync_pulse_width: 8
+    hsync_front_porch: 10
+    hsync_back_porch: 20
+    vsync_pulse_width: 8
+    vsync_front_porch: 10
+    vsync_back_porch: 10
+    init_sequence:
+      - 1
+      - [0xFF, 0x77, 0x01, 0x00, 0x00, 0x10]   # select command page BK0
+      - [0xCD, 0x00]                           # disable the MDT flag
+    data_pins:
+      red: [11, 12, 13, 14, 0]
+      green: [8, 20, 3, 46, 9, 10]
+      blue: [4, 5, 6, 7, 15]

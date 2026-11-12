@@ -1,0 +1,6 @@
+# Text files keep Unix line endings on every machine: the shell scripts in deploy/ are
+# copied from a Windows PC to a Raspberry Pi, where a Windows line ending breaks them.
+* text=auto eol=lf
+*.jpg binary
+*.png binary
+*.tflite binary
