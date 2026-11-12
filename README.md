@@ -6,6 +6,13 @@ on the real TV it works out what the song is and puts the album cover up with
 the title and artist, usually within about 20 seconds. When there's no music it
 cycles through my own photos. I built the case and the software behind it.
 
+<p align="center">
+  <img src="photos/retro-tv-idle-photo.jpg" alt="The little retro TV, showing one of my photos while no music is playing" width="32%">
+  &nbsp;
+  <img src="photos/retro-tv-song-cover.jpg" alt="The screen when a song is recognised: album cover, title, artist and album" width="64%">
+</p>
+<p align="center"><em>Left: no music, so it cycles through my photos. Right: a song it just heard.</em></p>
+
 The rest of this page is the build log and the technical notes.
 
 ## In short
